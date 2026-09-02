@@ -1,30 +1,29 @@
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-
 # ============================================================
-# PROJECT PATH
+# PATH CONFIGURATION
 # ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = PROJECT_DIR / "backend"
 
 if not BACKEND_DIR.exists():
-    raise RuntimeError(
-        f"Backend folder not found: {BACKEND_DIR}"
-    )
+    raise RuntimeError(f"Backend folder not found: {BACKEND_DIR}")
 
 sys.path.insert(0, str(BACKEND_DIR))
 
 
 # ============================================================
-# SUPABASE
+# BACKEND IMPORTS
 # ============================================================
 
 from supabase_client import supabase
+from hybrid_search import hybrid_search
+from ai_answer import answer_product_query
 
 
 # ============================================================
@@ -35,18 +34,17 @@ PRODUCTS_TABLE = "products"
 SPECS_TABLE = "product_specs"
 MAPPING_TABLE = "product_image_map"
 IMAGES_TABLE = "product_images"
-
 STORAGE_BUCKET = "product-image"
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
     title="OCR Product Retrieval API",
-    description="API for retrieving products, specifications and images",
-    version="1.0.0"
+    description="AI-powered OCR product retrieval with specifications and images",
+    version="2.0.0"
 )
 
 
@@ -59,12 +57,12 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 
 # ============================================================
-# CREATE STORAGE URL
+# IMAGE URL
 # ============================================================
 
 def create_image_url(storage_path):
@@ -73,23 +71,18 @@ def create_image_url(storage_path):
         return None
 
     try:
-
-        response = (
+        return (
             supabase
             .storage
             .from_(STORAGE_BUCKET)
             .get_public_url(storage_path)
         )
 
-        return response
-
     except Exception as e:
-
         print(
             f"WARNING: Could not create image URL "
             f"for {storage_path}: {e}"
         )
-
         return None
 
 
@@ -102,11 +95,12 @@ def root():
 
     return {
         "message": "OCR Product Retrieval API is running",
-        "version": "1.0.0",
-
+        "version": "2.0.0",
         "endpoints": {
             "health": "/health",
             "all_products": "/products",
+            "ai_product_query": "/products/ask",
+            "product_search": "/products/search",
             "product_by_code": "/products/{product_code}",
             "product_by_id": "/products/id/{product_id}"
         }
@@ -181,6 +175,89 @@ def get_all_products():
 
 
 # ============================================================
+# PRODUCT SEARCH
+# ============================================================
+
+@app.get("/products/search")
+def search_products(
+    q: str = Query(
+        ...,
+        min_length=1,
+        description="Product search query"
+    ),
+    limit: int = Query(
+        default=5,
+        ge=1,
+        le=20
+    ),
+):
+
+    try:
+
+        results = hybrid_search(
+            q,
+            limit=limit
+        )
+
+        # Never expose embeddings
+        for result in results:
+
+            result.pop("embedding", None)
+
+        return {
+            "query": q,
+            "count": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Product search failed: {str(e)}"
+        )
+
+
+# ============================================================
+# AI PRODUCT QUERY
+# ============================================================
+
+@app.get("/products/ask")
+def ask_product(
+    q: str = Query(
+        ...,
+        min_length=1,
+        description="Natural-language product question"
+    ),
+    limit: int = Query(
+        default=5,
+        ge=1,
+        le=10
+    ),
+):
+
+    try:
+
+        result = answer_product_query(
+            query=q,
+            limit=limit
+        )
+
+        return {
+            "query": result["query"],
+            "answer": result["answer"],
+            "results": result["results"]
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI product query failed: {str(exc)}"
+        )
+
+
+# ============================================================
 # PRODUCT BY CODE
 # ============================================================
 
@@ -189,95 +266,62 @@ def get_product(product_code: str):
 
     try:
 
-        # ----------------------------------------------------
-        # FETCH PRODUCT
-        # ----------------------------------------------------
-
-        product_response = (
+        response = (
             supabase
             .table(PRODUCTS_TABLE)
-            .select(
-                "id, product_code, product_name, "
-                "page_number, document_id, created_at"
-            )
-            .eq(
-                "product_code",
-                product_code
-            )
+            .select("*")
+            .eq("product_code", product_code)
             .limit(1)
             .execute()
         )
 
-        products = product_response.data or []
-
-        if not products:
+        if not response.data:
 
             raise HTTPException(
                 status_code=404,
                 detail=f"Product not found: {product_code}"
             )
 
-        product = products[0]
+        product = response.data[0]
 
         product_id = product["id"]
 
-
         # ----------------------------------------------------
-        # FETCH SPECIFICATIONS
+        # Specifications
         # ----------------------------------------------------
 
         specs_response = (
             supabase
             .table(SPECS_TABLE)
             .select("*")
-            .eq(
-                "product_id",
-                product_id
-            )
-            .order("id")
+            .eq("product_id", product_id)
+            .limit(1)
             .execute()
         )
 
-        specifications = specs_response.data or []
-
+        specifications = (
+            specs_response.data[0]
+            if specs_response.data
+            else {}
+        )
 
         # ----------------------------------------------------
-        # FETCH IMAGE MAPPINGS
+        # Image mappings
         # ----------------------------------------------------
 
         mapping_response = (
             supabase
             .table(MAPPING_TABLE)
-            .select("*")
-            .eq(
-                "product_id",
-                product_id
-            )
-            .order("id")
+            .select("image_id")
+            .eq("product_id", product_id)
+            .order("image_id")
             .execute()
         )
 
-        mappings = mapping_response.data or []
-
-
-        # ----------------------------------------------------
-        # EXTRACT IMAGE IDS
-        # ----------------------------------------------------
-
-        image_ids = []
-
-        for mapping in mappings:
-
-            image_id = mapping.get("image_id")
-
-            if image_id is not None:
-
-                image_ids.append(image_id)
-
-
-        # ----------------------------------------------------
-        # FETCH IMAGES
-        # ----------------------------------------------------
+        image_ids = [
+            row["image_id"]
+            for row in (mapping_response.data or [])
+        ]
 
         images = []
 
@@ -287,125 +331,36 @@ def get_product(product_code: str):
                 supabase
                 .table(IMAGES_TABLE)
                 .select("*")
-                .in_(
-                    "id",
-                    image_ids
-                )
-                .order("id")
+                .in_("id", image_ids)
                 .execute()
             )
 
-            images = images_response.data or []
+            image_lookup = {
+                image["id"]: image
+                for image in (images_response.data or [])
+            }
 
+            for image_id in image_ids:
 
-        # ----------------------------------------------------
-        # CREATE IMAGE RESPONSE
-        # ----------------------------------------------------
+                image = image_lookup.get(image_id)
 
-        image_results = []
+                if not image:
+                    continue
 
-        for image in images:
+                image["image_url"] = create_image_url(
+                    image.get("storage_path")
+                )
 
-            storage_path = image.get(
-                "storage_path"
-            )
-
-            image_results.append(
-                {
-                    "id": image.get("id"),
-
-                    "file_name": image.get(
-                        "file_name"
-                    ),
-
-                    "image_type": image.get(
-                        "image_type"
-                    ),
-
-                    "storage_path": storage_path,
-
-                    "image_url": create_image_url(
-                        storage_path
-                    ),
-
-                    "mime_type": image.get(
-                        "mime_type"
-                    ),
-
-                    "width": image.get(
-                        "width"
-                    ),
-
-                    "height": image.get(
-                        "height"
-                    ),
-
-                    "created_at": image.get(
-                        "created_at"
-                    )
-                }
-            )
-
-
-        # ----------------------------------------------------
-        # FINAL RESPONSE
-        # ----------------------------------------------------
+                images.append(image)
 
         return {
-
-            "success": True,
-
-            "product": {
-
-                "id": product.get(
-                    "id"
-                ),
-
-                "product_code": product.get(
-                    "product_code"
-                ),
-
-                "product_name": product.get(
-                    "product_name"
-                ),
-
-                "page_number": product.get(
-                    "page_number"
-                ),
-
-                "document_id": product.get(
-                    "document_id"
-                ),
-
-                "created_at": product.get(
-                    "created_at"
-                )
-            },
-
-            "specifications":
-                specifications,
-
-            "images":
-                image_results,
-
-            "summary": {
-
-                "specifications_count":
-                    len(specifications),
-
-                "image_mappings_count":
-                    len(mappings),
-
-                "images_count":
-                    len(image_results)
-            }
+            "product": product,
+            "specifications": specifications,
+            "images": images
         }
 
-
     except HTTPException:
-
         raise
-
 
     except Exception as e:
 
@@ -424,94 +379,60 @@ def get_product_by_id(product_id: int):
 
     try:
 
-        # ----------------------------------------------------
-        # FETCH PRODUCT
-        # ----------------------------------------------------
-
-        product_response = (
+        response = (
             supabase
             .table(PRODUCTS_TABLE)
             .select("*")
-            .eq(
-                "id",
-                product_id
-            )
+            .eq("id", product_id)
             .limit(1)
             .execute()
         )
 
-        products = product_response.data or []
-
-        if not products:
+        if not response.data:
 
             raise HTTPException(
                 status_code=404,
-                detail=f"Product ID not found: {product_id}"
+                detail=f"Product not found: {product_id}"
             )
 
-        product = products[0]
-
+        product = response.data[0]
 
         # ----------------------------------------------------
-        # FETCH SPECIFICATIONS
+        # Specifications
         # ----------------------------------------------------
 
         specs_response = (
             supabase
             .table(SPECS_TABLE)
             .select("*")
-            .eq(
-                "product_id",
-                product_id
-            )
-            .order("id")
+            .eq("product_id", product_id)
+            .limit(1)
             .execute()
         )
 
-        specifications = specs_response.data or []
-
+        specifications = (
+            specs_response.data[0]
+            if specs_response.data
+            else {}
+        )
 
         # ----------------------------------------------------
-        # FETCH MAPPINGS
+        # Image mappings
         # ----------------------------------------------------
 
         mapping_response = (
             supabase
             .table(MAPPING_TABLE)
-            .select("*")
-            .eq(
-                "product_id",
-                product_id
-            )
-            .order("id")
+            .select("image_id")
+            .eq("product_id", product_id)
+            .order("image_id")
             .execute()
         )
 
-        mappings = mapping_response.data or []
-
-
-        # ----------------------------------------------------
-        # IMAGE IDS
-        # ----------------------------------------------------
-
-        image_ids = []
-
-        for mapping in mappings:
-
-            image_id = mapping.get(
-                "image_id"
-            )
-
-            if image_id is not None:
-
-                image_ids.append(
-                    image_id
-                )
-
-
-        # ----------------------------------------------------
-        # FETCH IMAGES
-        # ----------------------------------------------------
+        image_ids = [
+            row["image_id"]
+            for row in (mapping_response.data or [])
+        ]
 
         images = []
 
@@ -521,80 +442,36 @@ def get_product_by_id(product_id: int):
                 supabase
                 .table(IMAGES_TABLE)
                 .select("*")
-                .in_(
-                    "id",
-                    image_ids
-                )
-                .order("id")
+                .in_("id", image_ids)
                 .execute()
             )
 
-            images = (
-                images_response.data
-                or []
-            )
+            image_lookup = {
+                image["id"]: image
+                for image in (images_response.data or [])
+            }
 
+            for image_id in image_ids:
 
-        # ----------------------------------------------------
-        # ADD IMAGE URL
-        # ----------------------------------------------------
+                image = image_lookup.get(image_id)
 
-        image_results = []
+                if not image:
+                    continue
 
-        for image in images:
-
-            storage_path = image.get(
-                "storage_path"
-            )
-
-            image_copy = dict(image)
-
-            image_copy["image_url"] = (
-                create_image_url(
-                    storage_path
+                image["image_url"] = create_image_url(
+                    image.get("storage_path")
                 )
-            )
 
-            image_results.append(
-                image_copy
-            )
-
-
-        # ----------------------------------------------------
-        # FINAL RESPONSE
-        # ----------------------------------------------------
+                images.append(image)
 
         return {
-
-            "success": True,
-
-            "product":
-                product,
-
-            "specifications":
-                specifications,
-
-            "images":
-                image_results,
-
-            "summary": {
-
-                "specifications_count":
-                    len(specifications),
-
-                "image_mappings_count":
-                    len(mappings),
-
-                "images_count":
-                    len(image_results)
-            }
+            "product": product,
+            "specifications": specifications,
+            "images": images
         }
 
-
     except HTTPException:
-
         raise
-
 
     except Exception as e:
 
@@ -612,33 +489,9 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    print("=" * 80)
-    print("OCR PRODUCT RETRIEVAL API")
-    print("=" * 80)
-
-    print()
-    print("API:")
-    print("http://127.0.0.1:8000")
-
-    print()
-    print("Swagger:")
-    print("http://127.0.0.1:8000/docs")
-
-    print()
-    print("All products:")
-    print("http://127.0.0.1:8000/products")
-
-    print()
-    print("Product:")
-    print(
-        "http://127.0.0.1:8000/products/{product_code}"
-    )
-
-    print("=" * 80)
-
     uvicorn.run(
-        app,
+        "api:app",
         host="127.0.0.1",
         port=8000,
-        reload=False
+        reload=True
     )
